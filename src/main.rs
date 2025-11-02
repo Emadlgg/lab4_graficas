@@ -2,93 +2,67 @@ mod color;
 mod framebuffer;
 mod triangle;
 mod obj_loader;
+mod vertex;
+mod fragment;
+mod shaders;
+mod camera;
 
 use crate::color::Color;
 use crate::framebuffer::{Framebuffer, SCREEN_WIDTH, SCREEN_HEIGHT};
 use crate::triangle::Triangle;
 use crate::obj_loader::Model;
+use crate::vertex::Vertex;
+use crate::shaders::{vertex_shader, fragment_shader, create_model_matrix, create_viewport_matrix, Uniforms};
+use crate::camera::Camera;
 
 use minifb::{Key, Window, WindowOptions};
 use nalgebra_glm::{Vec3, Mat4};
+use std::time::Instant;
 
-fn create_rotation_matrix(rotation: &Vec3) -> Mat4 {
-    let rotation_x = nalgebra_glm::rotation(rotation.x, &Vec3::new(1.0, 0.0, 0.0));
-    let rotation_y = nalgebra_glm::rotation(rotation.y, &Vec3::new(0.0, 1.0, 0.0));
-    let rotation_z = nalgebra_glm::rotation(rotation.z, &Vec3::new(0.0, 0.0, 1.0));
-    rotation_z * rotation_y * rotation_x
-}
+fn render(
+    framebuffer: &mut Framebuffer,
+    uniforms: &Uniforms,
+    vertex_array: &[Vertex],
+    shader_type: &str,
+) {
+    let mut transformed_vertices = Vec::with_capacity(vertex_array.len());
+    for vertex in vertex_array {
+        let transformed = vertex_shader(vertex, uniforms);
+        transformed_vertices.push(transformed);
+    }
 
-fn apply_transform(matrix: &Mat4, point: &Vec3) -> Vec3 {
-    let x = matrix[(0, 0)] * point.x + matrix[(0, 1)] * point.y + matrix[(0, 2)] * point.z + matrix[(0, 3)];
-    let y = matrix[(1, 0)] * point.x + matrix[(1, 1)] * point.y + matrix[(1, 2)] * point.z + matrix[(1, 3)];
-    let z = matrix[(2, 0)] * point.x + matrix[(2, 1)] * point.y + matrix[(2, 2)] * point.z + matrix[(2, 3)];
-    Vec3::new(x, y, z)
-}
+    let mut triangles = Vec::new();
+    for i in (0..transformed_vertices.len()).step_by(3) {
+        if i + 2 < transformed_vertices.len() {
+            triangles.push(Triangle::new_from_vertices(
+                transformed_vertices[i].clone(),
+                transformed_vertices[i + 1].clone(),
+                transformed_vertices[i + 2].clone(),
+            ));
+        }
+    }
 
-fn calculate_normal(v1: &Vec3, v2: &Vec3, v3: &Vec3) -> Vec3 {
-    let edge1 = v2 - v1;
-    let edge2 = v3 - v1;
-    nalgebra_glm::normalize(&nalgebra_glm::cross(&edge1, &edge2))
-}
+    let mut all_fragments = Vec::new();
+    for triangle in &triangles {
+        let fragments = triangle.draw(framebuffer);
+        all_fragments.extend(fragments);
+    }
 
-fn render(framebuffer: &mut Framebuffer, model: &Model, rotation: &Vec3, use_lighting: bool) {
-    let rotation_matrix = create_rotation_matrix(rotation);
-    
-    // Dirección de la luz (desde arriba-derecha-frente)
-    let light_dir = nalgebra_glm::normalize(&Vec3::new(0.5, -0.5, -1.0));
-    
-    // Recorrer todas las caras del modelo
-    for face in &model.faces {
-        if face.len() >= 3 {
-            let idx1 = face[0];
-            let idx2 = face[1];
-            let idx3 = face[2];
-
-            if idx1 < model.vertices.len() && 
-               idx2 < model.vertices.len() && 
-               idx3 < model.vertices.len() {
-                
-                // Obtener vértices originales centrados
-                let center = Vec3::new(SCREEN_WIDTH as f32 / 2.0, SCREEN_HEIGHT as f32 / 2.0, 0.0);
-                let v1_centered = model.vertices[idx1];
-                let v2_centered = model.vertices[idx2];
-                let v3_centered = model.vertices[idx3];
-
-                // Aplicar rotación
-                let v1_rot = apply_transform(&rotation_matrix, &v1_centered);
-                let v2_rot = apply_transform(&rotation_matrix, &v2_centered);
-                let v3_rot = apply_transform(&rotation_matrix, &v3_centered);
-
-                let v1 = v1_rot + center;
-                let v2 = v2_rot + center;
-                let v3 = v3_rot + center;
-
-                // Calcular iluminación si está activada
-                if use_lighting {
-                    let normal = calculate_normal(&v1_rot, &v2_rot, &v3_rot);
-                    let intensity = nalgebra_glm::dot(&normal, &light_dir).max(0.0);
-                    
-                    // Color base amarillo con iluminación
-                    let base_color = Color::new(255, 255, 0);
-                    let lit_color = Color::new(
-                        (base_color.r as f32 * (0.3 + 0.7 * intensity)) as u8,
-                        (base_color.g as f32 * (0.3 + 0.7 * intensity)) as u8,
-                        (base_color.b as f32 * (0.3 + 0.7 * intensity)) as u8,
-                    );
-                    framebuffer.set_current_color(lit_color);
-                }
-
-                // Dibujar el triángulo
-                let triangle = Triangle::new(v1, v2, v3);
-                triangle.draw(framebuffer);
-            }
+    for fragment in all_fragments {
+        let x = fragment.position.x as usize;
+        let y = fragment.position.y as usize;
+        
+        if x < framebuffer.width && y < framebuffer.height {
+            let shaded_color = fragment_shader(&fragment, uniforms, shader_type);
+            framebuffer.set_current_color(shaded_color);
+            framebuffer.point(x, y, fragment.depth);
         }
     }
 }
 
 fn main() {
     let mut window = Window::new(
-        "Software Renderer - Spaceship [WASD/Flechas: Rotar | L: Luz | R: Reset]",
+        "3D Renderer [WASD/Flechas: Cámara | 1-5: Shaders | R: Reset | ESC: Salir]",
         SCREEN_WIDTH,
         SCREEN_HEIGHT,
         WindowOptions::default(),
@@ -100,69 +74,109 @@ fn main() {
     window.set_target_fps(60);
 
     let mut framebuffer = Framebuffer::new(SCREEN_WIDTH, SCREEN_HEIGHT);
-    framebuffer.set_background_color(Color::new(0, 0, 0));
+    framebuffer.set_background_color(Color::new(20, 20, 40));
 
     let mut model = Model::load_from_file("spaceship.obj")
         .expect("No se pudo cargar el archivo OBJ");
-
-    model.normalize_and_center(SCREEN_WIDTH as f32, SCREEN_HEIGHT as f32, 300.0);
+    model.normalize_and_center(1.5);
 
     println!("Modelo cargado:");
     println!("  Vértices: {}", model.vertices.len());
-    println!("  Caras: {}", model.faces.len());
     println!("\nControles:");
-    println!("  W/S o ↑/↓: Rotar en X");
-    println!("  A/D o ←/→: Rotar en Y");
-    println!("  Q/E: Rotar en Z");
-    println!("  L: Activar/desactivar iluminación");
-    println!("  R: Resetear rotación");
+    println!("  W/S o ↑/↓: Orbitar verticalmente");
+    println!("  A/D o ←/→: Orbitar horizontalmente");
+    println!("  Q/E: Zoom");
+    println!("  1: Shader estático");
+    println!("  2: Shader difuso");
+    println!("  3: Cel Shading");
+    println!("  4: Shader procedural");
+    println!("  5: Normal Map");
+    println!("  R: Resetear cámara");
     println!("  ESC: Salir");
 
-    // Variables para rotación
+    let mut camera = Camera::new(
+        Vec3::new(0.0, 0.0, 5.0),
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(0.0, 1.0, 0.0),
+    );
+
     let mut rotation = Vec3::new(0.0, 0.0, 0.0);
-    let rotation_speed = 0.05;
-    let mut use_lighting = true;
+    let mut current_shader = "diffuse";
+    let start_time = Instant::now();
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
-        // Controles de rotación
+        let time = start_time.elapsed().as_secs_f32();
+
+        // Controles de cámara
         if window.is_key_down(Key::W) || window.is_key_down(Key::Up) {
-            rotation.x += rotation_speed;
+            camera.orbit(0.0, 0.05);
         }
         if window.is_key_down(Key::S) || window.is_key_down(Key::Down) {
-            rotation.x -= rotation_speed;
+            camera.orbit(0.0, -0.05);
         }
         if window.is_key_down(Key::A) || window.is_key_down(Key::Left) {
-            rotation.y += rotation_speed;
+            camera.orbit(-0.05, 0.0);
         }
         if window.is_key_down(Key::D) || window.is_key_down(Key::Right) {
-            rotation.y -= rotation_speed;
+            camera.orbit(0.05, 0.0);
         }
         if window.is_key_down(Key::Q) {
-            rotation.z += rotation_speed;
+            camera.zoom(-0.1);
         }
         if window.is_key_down(Key::E) {
-            rotation.z -= rotation_speed;
+            camera.zoom(0.1);
         }
-        
-        // Toggle iluminación
-        if window.is_key_pressed(Key::L, minifb::KeyRepeat::No) {
-            use_lighting = !use_lighting;
-            println!("Iluminación: {}", if use_lighting { "Activada" } else { "Desactivada" });
+
+        // Selección de shaders
+        if window.is_key_pressed(Key::Key1, minifb::KeyRepeat::No) {
+            current_shader = "static_color";
+            println!("Shader: Estático");
         }
-        
-        // Reset rotación
+        if window.is_key_pressed(Key::Key2, minifb::KeyRepeat::No) {
+            current_shader = "diffuse";
+            println!("Shader: Difuso");
+        }
+        if window.is_key_pressed(Key::Key3, minifb::KeyRepeat::No) {
+            current_shader = "cel_shading";
+            println!("Shader: Cel Shading");
+        }
+        if window.is_key_pressed(Key::Key4, minifb::KeyRepeat::No) {
+            current_shader = "procedural";
+            println!("Shader: Procedural");
+        }
+        if window.is_key_pressed(Key::Key5, minifb::KeyRepeat::No) {
+            current_shader = "normal_map";
+            println!("Shader: Normal Map");
+        }
+
+        // Reset cámara
         if window.is_key_pressed(Key::R, minifb::KeyRepeat::No) {
+            camera = Camera::new(
+                Vec3::new(0.0, 0.0, 5.0),
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            );
             rotation = Vec3::new(0.0, 0.0, 0.0);
-            println!("Rotación reseteada");
+            println!("Cámara reseteada");
         }
 
         framebuffer.clear();
 
-        if !use_lighting {
-            framebuffer.set_current_color(Color::new(255, 255, 0));
-        }
+        let model_matrix = create_model_matrix(Vec3::new(0.0, 0.0, 0.0), 1.0, rotation);
+        let view_matrix = camera.get_view_matrix();
+        let projection_matrix = camera.get_projection_matrix(SCREEN_WIDTH as f32 / SCREEN_HEIGHT as f32);
+        let viewport_matrix = create_viewport_matrix(SCREEN_WIDTH as f32, SCREEN_HEIGHT as f32);
 
-        render(&mut framebuffer, &model, &rotation, use_lighting);
+        let uniforms = Uniforms {
+            model_matrix,
+            view_matrix,
+            projection_matrix,
+            viewport_matrix,
+            time,
+            light_dir: Vec3::new(0.5, -0.5, -1.0),
+        };
+
+        render(&mut framebuffer, &uniforms, &model.vertices, current_shader);
 
         window
             .update_with_buffer(&framebuffer.buffer, SCREEN_WIDTH, SCREEN_HEIGHT)
